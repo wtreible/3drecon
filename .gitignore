@@ -1,0 +1,14 @@
+# Source videos — archived so project setups can be re-run (different fps/quality/defaults),
+# but too large to commit.
+demo_videos/
+
+# Generated reconstruction outputs (frames, COLMAP models, splats, meshes, logs) — large and
+# fully regenerable from demo_videos/ via `recon setup` + `recon make`.
+projects/
+
+# Model-weight / extension / scratch caches (HF weights, gsplat JIT cache, container HOME)
+data/
+
+# Python bytecode
+__pycache__/
+*.pyc

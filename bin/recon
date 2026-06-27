@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+# recon — thin dispatcher around the reconstruction Docker images.
+#
+#   recon build            Build recon-sfm then recon-dl, and pull the ODM image
+#   recon build sfm|dl     Build a single image
+#   recon doctor           GPU + toolchain smoke tests inside the containers
+#   recon setup <src>      Ingest a folder of files into a pipeline-ready project (+ manifest)
+#   recon scenes <video> [--split]   Detect fade/scene cuts (and optionally split into clips)
+#   recon products <proj>  Show the OUTPUT catalog for a project (what you can make)
+#   recon menu <proj> [--configure]  Interactive picker; multi-select outputs (+ tune options)
+#   recon make <out> <proj> [opts]   Make an output: frames|sparse|dense|splat|nerf|vggt|ortho|...
+#   recon sfm   <cmd...>    Run a command in the recon-sfm container (COLMAP/GLOMAP/CV)
+#   recon dl    <cmd...>    Run a command in the recon-dl container (torch/gsplat/ns/vggt)
+#   recon odm   <args...>   Run OpenDroneMap
+#   recon colmap <args...>  Shortcut: recon sfm colmap <args...>
+#   recon shell sfm|dl      Interactive shell in a container
+#
+# The repo root is bind-mounted at /work; cd there before calling tools that take paths.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMPOSE=(docker compose -f "$REPO_ROOT/docker/docker-compose.yml")
+
+# Run the sfm/dl containers as the invoking host user so outputs (frames, colmap, exports)
+# are owned by you, not root — a host-side `rm`/edit then just works. Caches and projects live
+# under /work (bind-mounted) and are chowned to this UID; HOME points at a writable /work path
+# so tools that touch ~/.cache don't fail for a UID with no /etc/passwd entry.
+# Escape hatch: RECON_ROOT=1 runs as root again (for image maintenance / chown fixes).
+RUNAS=(--user "$(id -u):$(id -g)" -e "HOME=/work/data/home")
+[ -n "${RECON_ROOT:-}" ] && RUNAS=()
+
+# Zenburn-ish whiptail theme (named ANSI colors only): dark ground, muted green/cyan
+# accents, pale text — no Red Hat pink. Inherited by the Python setup's whiptail too.
+export NEWT_COLORS='
+root=white,black
+shadow=black,gray
+border=green,black
+title=brightcyan,black
+window=white,black
+textbox=white,black
+label=white,black
+entry=black,lightgray
+listbox=white,black
+actlistbox=black,cyan
+sellistbox=white,black
+actsellistbox=black,cyan
+checkbox=green,black
+actcheckbox=black,cyan
+button=white,black
+actbutton=black,white
+compactbutton=white,black
+helpline=brightcyan,black
+roottext=white,black
+emptyscale=white,gray
+fullscale=black,green
+'
+
+usage() { sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+# Echo a project's image directory (relative to repo root): frames/ or images/ by
+# convention, else the subdirectory holding the most images (handles imported datasets
+# like KITTI, whose frames live in image_02/data). Empty if none found.
+resolve_frames() {
+  local p="${1%/}" d best
+  for d in frames images; do
+    [ -d "$REPO_ROOT/$p/$d" ] && [ -n "$(ls -A "$REPO_ROOT/$p/$d" 2>/dev/null)" ] && { echo "$p/$d"; return; }
+  done
+  best=$(find "$REPO_ROOT/$p" -type f \( -iname '*.jpg' -o -iname '*.png' -o -iname '*.jpeg' \) \
+           -printf '%h\n' 2>/dev/null | sort | uniq -c | sort -rn | head -1 | awk '{$1=""; sub(/^ /,""); print}')
+  [ -n "$best" ] && echo "${best#"$REPO_ROOT"/}"
+  return 0   # never fail (empty output is valid) — else `x=$(resolve_frames)` aborts under set -e
+}
+
+# Has an output already been produced? $1=key $2=proj [$3=seq]. Per-type/<seq> when seq given.
+is_done() {
+  local p="$REPO_ROOT/${2%/}" sub=""
+  [ -n "${3:-}" ] && sub="/$3"
+  case "$1" in
+    frames)    [ -d "$p/frames$sub" ] && [ -n "$(ls -A "$p/frames$sub" 2>/dev/null)" ] ;;
+    sparse)    ls "$p"/colmap"$sub"/sparse/*/images.bin >/dev/null 2>&1 ;;
+    dense)     [ -f "$p/colmap$sub/dense/fused.ply" ] ;;
+    splat)     ls "$p"/exports"$sub"/splat*.ply        >/dev/null 2>&1 ;;
+    nerf)      ls "$p"/exports"$sub"/*poisson*.ply      >/dev/null 2>&1 ;;
+    vggt)      ls "$p"/exports"$sub"/vggt*              >/dev/null 2>&1 ;;
+    ortho)     ls "$p"/odm/odm_orthophoto/*       >/dev/null 2>&1 ;;
+    localize)  [ -f "$p/localization/camera_poses.json" ] ;;
+    register)  ls "$p"/**/*_aligned*             >/dev/null 2>&1 ;;
+    calibrate) ls "$REPO_ROOT"/calib/intrinsics/*.json >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Ask one value via a whiptail inputbox (or read fallback); result in WT_VAL (never stdout,
+# so configure_opts can capture only its final args line).
+wt_input() {  # title prompt default
+  if command -v whiptail >/dev/null 2>&1 && [ -t 0 ]; then
+    WT_VAL=$(whiptail --title "$1" --inputbox "$2" 10 74 "$3" 3>&1 1>&2 2>&3) || WT_VAL="$3"
+    WT_VAL="${WT_VAL:-$3}"
+  else
+    read -rp "    $2 [$3]: " WT_VAL; WT_VAL="${WT_VAL:-$3}"
+  fi
+}
+
+# Prompt for a product's highest-impact options; echo the extra args to stdout.
+configure_opts() {
+  local t="options: $1"
+  case "$1" in
+    sparse)
+      wt_input "$t" "matcher  exhaustive | sequential | vocab" exhaustive; local m="$WT_VAL"
+      wt_input "$t" "mapper  colmap | glomap" colmap
+      echo "--matcher $m --mapper $WT_VAL" ;;
+    dense)
+      wt_input "$t" "max image size px (smaller = faster)" 2000
+      echo "--max-image-size $WT_VAL" ;;
+    splat)
+      wt_input "$t" "method  splatfacto | splatfacto-big" splatfacto; local me="$WT_VAL"
+      wt_input "$t" "iterations" 30000
+      echo "--method $me --iterations $WT_VAL" ;;
+    nerf)
+      wt_input "$t" "iterations" 30000
+      echo "--iterations $WT_VAL" ;;
+    vggt)
+      wt_input "$t" "max images (memory)" 16; local mi="$WT_VAL"
+      wt_input "$t" "keep points above confidence percentile" 50
+      echo "--max-images $mi --conf-percentile $WT_VAL" ;;
+    *) echo "" ;;
+  esac
+}
+
+# Echo a project's sequence names (from the manifest), one per line; NOTHING if flat
+# (no trailing newline — else mapfile would see one empty-string "phantom" sequence).
+seqs_of() {
+  local f="$REPO_ROOT/${1%/}/recon.json"
+  [ -f "$f" ] || return 0
+  python3 -c "import json,sys;n=[(s['name'] if isinstance(s,dict) else s) for s in (json.load(open(sys.argv[1])).get('sequences') or [])];sys.stdout.write('\n'.join(n))" "$f" 2>/dev/null
+  return 0
+}
+
+# Echo the raw_video path (repo-relative) for a given sequence.
+seq_video() {
+  local f="$REPO_ROOT/${1%/}/recon.json"
+  [ -f "$f" ] || return 0
+  python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(next((s['video'] for s in d.get('sequences',[]) if s['name']==sys.argv[2]),''))" "$f" "$2" 2>/dev/null
+  return 0
+}
+
+# Echo "<start> <end>" (seconds) for a scene-split sequence, or nothing if it has no range.
+seq_scene() {
+  local f="$REPO_ROOT/${1%/}/recon.json"
+  [ -f "$f" ] || return 0
+  python3 -c "import json,sys;d=json.load(open(sys.argv[1]));s=next((s for s in d.get('sequences',[]) if s['name']==sys.argv[2]),{});sc=s.get('scene');print('%g %g'%(sc[0],sc[1]) if sc else '')" "$f" "$2" 2>/dev/null
+  return 0
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  build)
+    target="${1:-all}"
+    case "$target" in
+      sfm) "${COMPOSE[@]}" build sfm ;;
+      dl)  "${COMPOSE[@]}" build dl ;;
+      all|"")
+        "${COMPOSE[@]}" build sfm
+        "${COMPOSE[@]}" build dl
+        docker pull opendronemap/odm:latest ;;
+      *) echo "unknown build target: $target" >&2; exit 2 ;;
+    esac ;;
+
+  doctor)
+    bash "$REPO_ROOT/scripts/doctor.sh" ;;
+
+  setup)
+    python3 "$REPO_ROOT/scripts/setup_project.py" "$@" ;;
+
+  scenes)
+    v="${1:?usage: recon scenes <video> [--split] [--out DIR]}"; shift || true
+    "$0" sfm python scripts/sfm/detect_scenes.py --video "$v" "$@" ;;
+
+  sfm)   "${COMPOSE[@]}" run --rm "${RUNAS[@]}" sfm "$@" ;;
+  dl)    "${COMPOSE[@]}" run --rm "${RUNAS[@]}" dl  "$@" ;;
+  odm)   "${COMPOSE[@]}" run --rm odm "$@" ;;
+  colmap) "${COMPOSE[@]}" run --rm "${RUNAS[@]}" sfm colmap "$@" ;;
+
+  shell)
+    svc="${1:-dl}"; shift || true
+    "${COMPOSE[@]}" run --rm "${RUNAS[@]}" --entrypoint bash "$svc" ;;
+
+  products)
+    "$0" sfm python scripts/products.py "$@" ;;
+
+  menu)
+    # Interactive multi-select picker. Default UI is a whiptail checklist (↑↓ move,
+    # Space toggles multiple, Enter runs). Use --text (or pipe input) for a numbered
+    # prompt that accepts "1 3 5" or "1,3". Selected outputs run in sequence.
+    proj="${1:?usage: recon menu <project> [--text] [--configure]}"; shift || true
+    force_text=0; configure=0
+    for a in "$@"; do case "$a" in --text) force_text=1;; --configure|-c) configure=1;; esac; done
+    R="$REPO_ROOT"
+    # multi-sequence project: pick a sequence (outputs then run with --seq)
+    seq=""
+    mapfile -t SEQS < <(seqs_of "$proj")
+    if [ ${#SEQS[@]} -gt 0 ]; then
+      if [ "$force_text" = 0 ] && command -v whiptail >/dev/null 2>&1 && [ -t 0 ]; then
+        items=(); for s in "${SEQS[@]}"; do items+=("$s" ""); done
+        seq=$(whiptail --title "$proj — sequences" --menu "Pick a sequence:" 18 64 "${#SEQS[@]}" "${items[@]}" 3>&1 1>&2 2>&3) || exit 0
+      else
+        echo "Sequences in $proj:"; PS3="Pick a sequence: "
+        select seq in "${SEQS[@]}"; do [ -n "$seq" ] && break; done
+      fi
+      [ -z "$seq" ] && exit 0
+    fi
+    sub=""; [ -n "$seq" ] && sub="/$seq"
+    title="$proj${seq:+ · $seq}"
+    if [ -n "$seq" ]; then
+      frames=""; [ -d "$R/$proj/frames/$seq" ] && [ -n "$(ls -A "$R/$proj/frames/$seq" 2>/dev/null)" ] && frames="$proj/frames/$seq"
+      rawvid=0; [ -n "$(seq_video "$proj" "$seq")" ] && rawvid=1
+    else
+      frames="$(resolve_frames "$proj")"
+      rawvid=0; ls "$R/$proj"/raw_video/* >/dev/null 2>&1 && rawvid=1
+    fi
+    sparse=0; ls "$R/$proj"/colmap"$sub"/sparse/*/images.bin >/dev/null 2>&1 && sparse=1
+    lidar=0
+    find "$R/$proj" -path '*velodyne_points/data/*.bin' -print -quit 2>/dev/null | grep -q . && lidar=1
+    [ -d "$R/$proj/lidar" ] && [ -n "$(ls -A "$R/$proj/lidar" 2>/dev/null)" ] && lidar=1
+    # inputs report: actual paths, one per line
+    nl=$'\n'
+    inputs="frames: ${frames:-(none)}$nl"
+    sp=(); for m in "$R/$proj"/colmap"$sub"/sparse/*/; do [ -f "${m}images.bin" ] && sp+=("${m%/}"); done
+    if [ ${#sp[@]} -gt 0 ]; then
+      inputs+="sparse: ${sp[0]#"$R"/}$nl"
+      for ((i=1; i<${#sp[@]}; i++)); do inputs+="        ${sp[i]#"$R"/}$nl"; done
+    else inputs+="sparse: (none)$nl"; fi
+    mapfile -t ld < <(find "$R/$proj" \( -path '*velodyne_points/data/*.bin' -o -path '*/lidar/*' \) \
+                        -type f 2>/dev/null | sed 's|/[^/]*$||' | sort -u)
+    if [ ${#ld[@]} -gt 0 ]; then
+      inputs+="lidar:  ${ld[0]#"$R"/}$nl"
+      for ((i=1; i<${#ld[@]}; i++)); do inputs+="        ${ld[i]#"$R"/}$nl"; done
+    else inputs+="lidar:  (none)"; fi
+    keys=(); labels=()
+    add(){ keys+=("$1"); labels+=("$2"); }
+    [ "$rawvid" = 1 ] && add frames "Extract frames from the data video"
+    [ -n "$frames" ] && add sparse "COLMAP SfM — sparse cloud + poses"
+    [ -n "$frames" ] && add dense "COLMAP MVS — dense cloud + mesh (auto-runs sparse)"
+    [ -n "$frames" ] && { add splat "Gaussian splat (.ply)"; add nerf "NeRF (nerfacto) + mesh"; \
+                          add vggt "Feed-forward poses+points (no COLMAP)"; }
+    [ "$lidar" = 1 ] && [ "$sparse" = 1 ] && add register "Align LiDAR to the reconstruction"
+    # ODM only reads <proj>/images/ (geotagged drone photos) — only offer it when present
+    { [ -d "$R/$proj/images" ] && [ -n "$(ls -A "$R/$proj/images" 2>/dev/null)" ]; } \
+      && add ortho "OpenDroneMap ortho/DEM/mesh (geotagged drone imagery)"
+    [ ${#keys[@]} -eq 0 ] && { echo "no inputs found in $title — add a video/images first" >&2; exit 1; }
+    GRN=$'\033[32m'; RST=$'\033[0m'
+    done_=(); for i in "${!keys[@]}"; do is_done "${keys[i]}" "$proj" "$seq" && done_+=(1) || done_+=(0); done
+    chosen=()
+    if [ "$force_text" = 0 ] && command -v whiptail >/dev/null 2>&1 && [ -t 0 ]; then
+      items=(); for i in "${!keys[@]}"; do
+        d=""; [ "${done_[i]}" = 1 ] && d="   [done]"
+        items+=("${keys[i]}" "${labels[i]}$d" OFF)
+      done
+      sel=$(whiptail --title "recon outputs · $title" \
+        --checklist "$inputs$nl${nl}Up/Down move · Space toggle · Enter run" \
+        22 90 "${#keys[@]}" "${items[@]}" 3>&1 1>&2 2>&3) || exit 0
+      eval "chosen=($sel)"
+    else
+      echo "Inputs for $title:"
+      echo "$inputs"
+      echo "Outputs:  (${GRN}● done${RST} = already produced)"
+      for i in "${!keys[@]}"; do
+        m=""; [ "${done_[i]}" = 1 ] && m="  ${GRN}● done${RST}"
+        printf "  %2d) %-9s %s%b\n" "$((i+1))" "${keys[i]}" "${labels[i]}" "$m"
+      done
+      read -rp $'\nPick one or more (e.g. "1 3 5" or "1,3"): ' line
+      line=${line//,/ }
+      for t in $line; do [[ $t =~ ^[0-9]+$ ]] && (( t>=1 && t<=${#keys[@]} )) && chosen+=("${keys[t-1]}"); done
+    fi
+    [ ${#chosen[@]} -eq 0 ] && { echo "nothing selected"; exit 0; }
+    echo "Selected: ${chosen[*]}${seq:+  (seq: $seq)}"
+    # optionally gather per-task options up front, so the runs proceed unattended
+    do_cfg=0
+    if [ "$configure" = 1 ]; then do_cfg=1
+    elif [ -t 0 ]; then
+      if command -v whiptail >/dev/null 2>&1; then
+        whiptail --title "Configure" --defaultno --yesno "Customize options for the selected outputs?\n\n(${chosen[*]})" 10 62 && do_cfg=1
+      else
+        read -rp $'\nCustomize options for the selected outputs? [y/N] ' a
+        [[ "$a" =~ ^[Yy] ]] && do_cfg=1
+      fi
+    fi
+    extras=()
+    for k in "${chosen[@]}"; do
+      if [ "$do_cfg" = 1 ]; then echo "  options for $k:" >&2; extras+=("$(configure_opts "$k")")
+      else extras+=(""); fi
+    done
+    for i in "${!chosen[@]}"; do
+      k="${chosen[i]}"; ex="${extras[i]}"
+      echo; echo "==> recon make $k $proj ${seq:+--seq $seq} $ex"
+      # shellcheck disable=SC2086
+      "$0" make "$k" "$proj" ${seq:+--seq "$seq"} $ex || echo "  ($k failed — continuing)"
+    done ;;
+
+  make)
+    product="${1:?usage: recon make <output> <project> [--seq <name>] [opts]}"
+    proj="${2:?usage: recon make <output> <project> [--seq <name>] [opts]}"; shift 2 || true
+    # pull --seq out of the remaining args; the rest pass through to the tool
+    seq=""; rest=()
+    while [ $# -gt 0 ]; do case "$1" in --seq) seq="$2"; shift 2;; *) rest+=("$1"); shift;; esac; done
+    set -- ${rest[@]+"${rest[@]}"}
+    mapfile -t SEQS < <(seqs_of "$proj")
+    if [ ${#SEQS[@]} -gt 0 ] && [ -z "$seq" ]; then
+      echo "'$proj' has sequences — add --seq <name>:" >&2
+      for s in "${SEQS[@]}"; do echo "  recon make $product $proj --seq $s" >&2; done
+      exit 1
+    fi
+    # per-type/<seq> dirs when a sequence is chosen; flat otherwise
+    sub=""; [ -n "$seq" ] && sub="/$seq"
+    COLMAPDIR="$proj/colmap$sub"; EXPORTS="$proj/exports$sub"; NERFBASE="$proj/nerfstudio$sub"
+    if [ -n "$seq" ]; then frames="$proj/frames/$seq"; else frames="$(resolve_frames "$proj")"; fi
+    sparse=""
+    if ls "$REPO_ROOT/$COLMAPDIR"/sparse/*/images.bin >/dev/null 2>&1; then
+      sparse=$(dirname "$(ls -S "$REPO_ROOT/$COLMAPDIR"/sparse/*/images.bin | head -1)")
+      sparse="${sparse#"$REPO_ROOT"/}"
+    fi
+    runcmd=()
+    case "$product" in
+      frames)
+        win=()
+        if [ -n "$seq" ]; then
+          vid="$(seq_video "$proj" "$seq")"
+          # scene-split sequences share one video + a [start,end] window -> per-scene frames
+          read -r s0 s1 <<<"$(seq_scene "$proj" "$seq")"
+          [ -n "${s0:-}" ] && win=( --start "$s0" --end "$s1" )
+        else vid="$(ls "$REPO_ROOT/$proj"/raw_video/* 2>/dev/null | head -1 || true)"; vid="${vid#"$REPO_ROOT"/}"; fi
+        [ -z "$vid" ] && { echo "no video for $proj${seq:+ (seq $seq)} — run 'recon setup' first" >&2; exit 1; }
+        runcmd=( "$0" sfm python scripts/sfm/video_to_frames.py --video "$vid" \
+                 --out "$proj/frames$sub" --target-fps 2.5 --max-frames 300 "${win[@]}" ) ;;
+      sparse) runcmd=( "$0" sfm python scripts/sfm/run_colmap.py auto --project "$proj" --colmap-dir "$COLMAPDIR" --images "$frames" --matcher exhaustive --mapper colmap ) ;;
+      dense)
+        # dense MVS needs camera poses — auto-run sparse first if there's no model yet
+        if [ -z "$sparse" ]; then
+          echo "no sparse model in $COLMAPDIR — running sparse first…"
+          "$0" make sparse "$proj" ${seq:+--seq "$seq"} || { echo "sparse step failed" >&2; exit 1; }
+          ls "$REPO_ROOT/$COLMAPDIR"/sparse/*/images.bin >/dev/null 2>&1 \
+            && sparse="$(dirname "$(ls -S "$REPO_ROOT/$COLMAPDIR"/sparse/*/images.bin | head -1)")" \
+            && sparse="${sparse#"$REPO_ROOT"/}"
+          [ -z "$sparse" ] && { echo "sparse produced no model — cannot run dense" >&2; exit 1; }
+        fi
+        runcmd=( "$0" sfm python scripts/sfm/colmap_dense.py --project "$proj" --sparse "$sparse" --images "$frames" --out "$COLMAPDIR/dense" ) ;;
+      splat|nerf)
+        method=splatfacto; [ "$product" = nerf ] && method=nerfacto
+        runcmd=( "$0" dl bash scripts/splat/process_and_train.sh --project "$proj" --data "$frames" --type images --out-base "$NERFBASE" --exports "$EXPORTS" )
+        [ -n "$sparse" ] && runcmd+=( --colmap "$sparse" )
+        runcmd+=( --method "$method" ) ;;
+      vggt)   runcmd=( "$0" dl python scripts/dl/vggt_infer.py --images "$frames" --out "$EXPORTS/vggt" ) ;;
+      ortho)
+        if [ ! -d "$REPO_ROOT/$proj/images" ] || [ -z "$(ls -A "$REPO_ROOT/$proj/images" 2>/dev/null)" ]; then
+          echo "ortho (OpenDroneMap) needs geotagged drone photos in $proj/images/" >&2
+          echo "  ODM reads only <project>/images/ (found images at: ${frames:-none})." >&2
+          exit 1
+        fi
+        runcmd=( "$0" odm --project-path /datasets "$(basename "$proj")" ) ;;
+      localize|register|calibrate)
+        echo "'$product' needs inputs you specify. Template:" >&2
+        case "$product" in
+          calibrate) echo "  recon sfm python scripts/calib/charuco_calibrate.py --board calib/boards/<board>.yaml --images $proj/<calib_imgs>/'*.jpg' --name <cam> --out calib/intrinsics" >&2 ;;
+          localize)  echo "  recon sfm python scripts/localize/cam_extrinsics.py --tag-map $proj/localization/tag_map.yaml --intrinsics calib/intrinsics/<cam>.json --views cam01=$proj/localization/cam01.jpg --out $proj/localization" >&2 ;;
+          register)  echo "  recon sfm python scripts/register/cloud_align.py --source $proj/lidar/<scan>.ply --target $proj/colmap/dense/fused.ply --out $proj/lidar/<scan>_aligned" >&2 ;;
+        esac; exit 1 ;;
+      *) echo "unknown output: $product  (run: recon products $proj)" >&2; exit 2 ;;
+    esac
+    runcmd+=( "$@" )
+    # per-run log: projects/<P>/logs/<runid>_<tool>.log  (runid encodes time [+ seq])
+    runid="$(date +%Y%m%d-%H%M%S)${seq:+_$seq}"
+    logfile="$proj/logs/${runid}_${product}.log"
+    mkdir -p "$REPO_ROOT/$proj/logs"
+    echo "+ ${runcmd[*]}   (log: $logfile)"
+    set +e
+    "${runcmd[@]}" 2>&1 | tee "$REPO_ROOT/$logfile"
+    rc=${PIPESTATUS[0]}
+    set -e
+    if [ -f "$REPO_ROOT/$proj/recon.json" ]; then
+      python3 "$REPO_ROOT/scripts/manifest.py" log "$proj" "$product" \
+        --status "$([ "$rc" -eq 0 ] && echo ok || echo failed)" --options "$*" \
+        ${seq:+--seq "$seq"} --runid "$runid" --log "$logfile" 2>/dev/null || true
+    fi
+    exit "$rc" ;;
+
+  help|-h|--help) usage ;;
+  *) echo "unknown command: $cmd" >&2; usage; exit 2 ;;
+esac
