@@ -41,6 +41,7 @@ bin/recon doctor
 recon build [sfm|dl]      build images (default: all + pull ODM)
 recon doctor              run smoke tests
 recon setup <src>         ingest a folder of files -> pipeline-ready project (+ manifest)
+recon scenes <video>      detect fade/scene cuts (--split to write per-scene clips)
 recon products <proj>     show the OUTPUT catalog for a project (what you can make)
 recon menu <proj> [-c]    interactive multi-select picker (+ per-task option prompts with -c)
 recon make <out> <proj>   make an output (auto-wires paths): frames|sparse|dense|splat|nerf|vggt|ortho|...
@@ -65,9 +66,12 @@ input-aware.
 
 **Scene/fade cuts → sequences.** A video with fades or hard cuts between segments (e.g. a
 walk-through that fades between rooms) reconstructs badly as one piece — the cuts break SfM. Setup
-offers to **detect and split** it: each detected scene becomes its own sequence. Standalone:
-`recon scenes <video>` (list scenes) or `recon scenes <video> --split` (write per-scene clips).
-Detection is fade-to-black (brightness dips) + hard cuts (histogram jumps), via cv2+ffmpeg.
+offers to **detect and split** it. The split is **frame-domain**: the one video is kept as-is and
+each detected scene becomes a sequence carrying a `[start,end]` time range, so frames extract
+straight into `frames/<scene>/` with no re-encoding or clip files. A min-scene-length picker (keep
+≥2s / drop brief ≥8s / rooms ≥15s) discards transition shots. Detection is fade-to-black
+(brightness dips) + hard cuts (histogram jumps), via cv2+ffmpeg. Standalone: `recon scenes <video>
+[--min-scene N]` lists scenes; `recon scenes <video> --split` writes per-scene clips for ad-hoc use.
 
 ```
 recon setup ~/Downloads/mill_walk      # interactive: classify files, set capture type
@@ -82,10 +86,11 @@ from scratch with different settings (frame rate, JPEG quality, capture defaults
 `recon setup` **copies** (never moves), so the archive stays intact. To re-run a project clean:
 
 ```
-rm -rf projects/<name>                 # discard the derived project
-recon setup demo_videos/<name>         # re-ingest from the archive (pick new fps/quality)
+recon setup demo_videos/<name>         # re-ingest (offers to remove the old project first)
 ```
-Or re-extract just the frames in place: `recon make frames projects/<name> [--seq <s>] --target-fps 4 --jpeg-quality 80`.
+Setup detects an existing project and offers to wipe it before recreating, so you don't have to
+`rm` by hand. Or re-extract just the frames in place:
+`recon make frames projects/<name> [--seq <s>] --target-fps 4 --jpeg-quality 80`.
 
 ## Outputs (the products menu)
 
@@ -99,7 +104,7 @@ ready-to-run command. Then `recon make <output> <proj>` builds it (auto-wiring t
 |---|---|---|
 | `frames` | a data video | sharp, evenly-spaced frames extracted from the video |
 | `sparse` | images | COLMAP SfM: sparse cloud + camera poses |
-| `dense` | sparse | COLMAP MVS: dense point cloud + Poisson mesh |
+| `dense` | images | COLMAP MVS: dense point cloud + Poisson mesh (auto-runs `sparse` first if needed) |
 | `splat` | images/sparse | gaussian splat `.ply` (scale-reg, auto-cleaned) |
 | `nerf` | images/sparse | NeRF (nerfacto) + Poisson mesh |
 | `ortho` | GPS-tagged images | OpenDroneMap orthomosaic + DEM + mesh |
@@ -123,15 +128,35 @@ Every `recon make` tees its full output to `projects/<P>/logs/<runid>_<tool>.log
 
 ## Project layout
 
+A single-video / single-image-set project is **flat**:
+
 ```
 projects/<name>/
-  raw_video|raw   frames|images   colmap/   splat/   localization/   lidar/   exports/
-calib/intrinsics/<camera>.json    # reusable per-camera calibration (calibrate once)
-calib/boards/                     # ChArUco board definitions + printables
-data/                             # shared datasets + model-weight caches
+  raw_video/  frames/  images/  colmap/  exports/  nerfstudio/  localization/  lidar/  logs/
+  recon.json
 ```
 
-Create a drone project with: `mkdir -p projects/drone_<site>/{raw,images,colmap,odm,splat,exports}`
+A project with **multiple data videos** (or a scene-split one) is **type-first**: each video is a
+**sequence**, and every output type holds a per-sequence subdir. The single `recon.json` lists the
+sequences; each run is tagged with its `seq`. Target one with `--seq <name>`:
+
+```
+projects/<name>/
+  raw_video/<video>.mp4
+  frames/<seq>/   colmap/<seq>/{sparse,dense}   exports/<seq>/   nerfstudio/<seq>/
+  recon.json      # sequences:[{name, video, scene:[t0,t1]?}], runs:[{seq, runid, log, ...}]
+
+recon make sparse projects/<name> --seq <seq>     # routes every stage into <type>/<seq>
+recon menu  projects/<name>                        # pick a sequence, then outputs
+```
+
+Shared across the project (not per-sequence): `calib/`, `lidar/`, `logs/`.
+
+```
+calib/intrinsics/<camera>.json    # reusable per-camera calibration (calibrate once)
+calib/boards/                     # ChArUco board definitions + printables
+data/                             # shared datasets + model-weight caches (git-ignored)
+```
 
 ---
 
@@ -205,12 +230,28 @@ This anchors LiDAR to the fiducial-defined metric frame by cloud-to-cloud regist
 `recon-lidar` image around Koide's `direct_visual_lidar_calibration` (ROS2); a LiDAR-visible
 planar/board target will materially improve accuracy.
 
+## Requirements & portability
+
+- **Linux + NVIDIA only.** The stack is CUDA end-to-end (CUDA COLMAP, torch cu128, gsplat). It runs
+  on native Linux or WSL2 with an NVIDIA GPU and the NVIDIA Container Toolkit. **macOS is not
+  supported** — there is no CUDA on macOS and Docker can't pass an NVIDIA GPU through; the
+  containers won't run there (a Mac can only drive a remote Linux GPU box).
+- **GPU arch.** The images default to **`sm_120` (RTX 5090)**. On another NVIDIA GPU, rebuild with
+  the right arch, e.g. `CUDA_ARCH=89 TORCH_CUDA_ARCH_LIST=8.9 recon build` (4090) — the Dockerfile
+  ARGs / env already accept this (`CUDA_TAG`, `CUDA_ARCH`, `TORCH_CUDA_ARCH_LIST`).
+- **Reproducibility.** Pinned: CUDA base tag, COLMAP 4.0.4, GLOMAP 1.2.0, gsplat 1.4.0. Floating
+  (latest at build time): torch/torchvision, nerfstudio, hloc, VGGT, and apt/pip deps — so a build
+  today is not guaranteed identical to one months from now. Build on a comparable machine soon for
+  best results.
+
 ## Notes / sharp edges
+- **Containers run as the invoking host user** (`--user $(id -u):$(id -g)` for `sfm`/`dl`), so
+  outputs (`frames/`, `colmap/`, `exports/`) are owned by you, not root — host-side `rm`/edits just
+  work. `HOME` points at `/work/data/home`. Override with `RECON_ROOT=1 recon …` for root-only
+  maintenance (apt, chowning). ODM still runs as root.
 - COLMAP-with-CUDA is the most fragile build; if it fights the toolchain, **Brush** (Rust/wgpu)
   is a CUDA-arch-free splat fallback, and CPU COLMAP still works (slower).
 - gsplat/VGGT wheels may lag the exact torch+cu128 combo — the Dockerfiles build from source with
   `TORCH_CUDA_ARCH_LIST=12.0` to cover that.
 - VGGT has a per-forward image-count ceiling: use it as an initializer/segment tool, not a
   whole-flight SfM replacement.
-- Change the CUDA base or arch via build args / env: `CUDA_TAG`, `CUDA_ARCH`, `TORCH_CUDA_ARCH_LIST`.
-# 3drecon
